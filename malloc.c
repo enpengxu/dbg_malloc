@@ -2,12 +2,13 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdint.h>
 
 #define DBG_MAGIC  0xef0fe326
 
 struct dbg_mem {
 	unsigned magic;
- 	void * ptr;
+	void * ptr;
 	size_t size;
 
 	struct dbg_mem * next;
@@ -37,12 +38,19 @@ struct dbg_ctx {
 
 static int dbg_ctx_init(struct dbg_ctx * ctx);
 static int dbg_dump();
+static int dbg_ptr_size(void *ptr);
 
-#define dbg_printf(...)  \
-	_tls_flag = 1;		 \
-	libc_printf(__VA_ARGS__);\
+#define DBG_DEBUG 1
+
+#ifdef DBG_DEBUG
+#define dbg_printf(...)						\
+	_tls_flag = 1;								\
+	if(libc_handle)							\
+		libc_printf(__VA_ARGS__);				\
 	_tls_flag = 0
-	
+#else
+#define dbg_printf(...)
+#endif
 
 static void * libc_handle = NULL;
 static void *(*libc_malloc)(size_t) = NULL;
@@ -52,28 +60,31 @@ static int (*libc_pthread_mutex_lock)(pthread_mutex_t *) = NULL;
 static int (*libc_pthread_mutex_unlock)(pthread_mutex_t *) = NULL;
 static int (*libc_pthread_mutex_init)(pthread_mutex_t *, const pthread_mutexattr_t *) = NULL;
 static int (*libc_clock_gettime)(clockid_t, struct timespec *);
+static void * (*libc_memcpy)(void *, const void *, size_t);
 
-unsigned mem_free = 0;
-static int mem_dummy[4096*1024];
+#define DUMMY_SIZE   64*4096
+static unsigned mem_free = 0;
+static int mem_dummy[DUMMY_SIZE];
 
 static __thread int _tls_flag = 0;
 
 static struct dbg_ctx dbg_ctx = { 0 };
 
-void * dbg_malloc(size_t size,
+void *
+dbg_malloc(size_t size,
 		const char *path, const char * func, int line)
 {
 	if (!libc_handle) {
 		unsigned off = mem_free;
-		mem_free += size;
-		return (void *)&mem_dummy[off];
+		mem_free += size + 1;
+		mem_dummy[off] = (int)size;
+		return (void *)&mem_dummy[off+1];
 	}
-	void * ptr = NULL;
 	if (_tls_flag) {
 		return libc_malloc(size);
 	}
 
-	ptr = libc_malloc(size + sizeof(struct dbg_mem));
+	void * ptr = libc_malloc(size + sizeof(struct dbg_mem));
 	if (ptr) {
 		struct dbg_mem * m = ptr;
 		m->magic = DBG_MAGIC;
@@ -83,27 +94,38 @@ void * dbg_malloc(size_t size,
 		m->func = func;
 		m->line = line;
 
+		_tls_flag = 1;
 		libc_pthread_mutex_lock(&dbg_ctx.mutex);
 		LIST_INSERT(&dbg_ctx.head, m);
-
-		libc_clock_gettime(CLOCK_MONOTONIC, &m->time);
-		ptr += sizeof(*m);
 		libc_pthread_mutex_unlock(&dbg_ctx.mutex);
 
+		libc_clock_gettime(CLOCK_MONOTONIC, &m->time);
+
 		dbg_printf("malloc: size = %d , ptr = %p \n", (int)size, ptr);
+
+		_tls_flag = 0;
+		ptr += sizeof(*m);
+
 	}
 	return ptr;
 }
 
-void dbg_free(void * ptr)
+void
+dbg_free(void * ptr)
 {
-	if (ptr >= mem_dummy && ptr < (mem_dummy + mem_free)) {
+	if (!ptr) {
+		return ;
+	}
+
+	size_t off = (uintptr_t)ptr - (uintptr_t)mem_dummy;
+	if (off > 0 && off < mem_free) {
+		/* dummy memory */
 		return;
 	}
 	if (libc_handle) {
 		if (ptr) {
-			dbg_printf("free: ptr = %p \n", ptr);
-			if (1) { //!_tls_flag) {
+			//dbg_printf("free: ptr = %p \n", ptr);
+			if (!_tls_flag) {
 				struct dbg_mem * m = (struct dbg_mem *)(ptr - sizeof(*m));
 				if (m && m->magic == DBG_MAGIC && m->ptr == m) {
 					libc_pthread_mutex_lock(&dbg_ctx.mutex);
@@ -112,9 +134,36 @@ void dbg_free(void * ptr)
 					ptr -= sizeof(*m);
 				}
 			}
+			dbg_printf("free: ptr = %p \n", ptr);
 			libc_free(ptr);
 		}
 	}
+}
+
+void *
+dbg_realloc(void *ptr, size_t size,
+			const char *path, const char *func, int line)
+{
+	void * new_ptr = NULL;
+	size_t old_size = 0;
+
+	dbg_printf("dbg_realloc : ptr = %p, size=%d \n", ptr, (int)size);
+
+	old_size = dbg_ptr_size(ptr);
+
+	new_ptr = dbg_malloc(size, path, func, line);
+	if (old_size > 0 && new_ptr) {
+		size_t cpy_size = old_size < size ? old_size : size;
+		if (libc_memcpy)
+			libc_memcpy(new_ptr, ptr, cpy_size);
+		else{
+			for (size_t i=0; i< cpy_size; i++){
+				((char *)new_ptr)[i] = ((char*)ptr)[i];
+			}
+		}
+	}
+	dbg_free(ptr);
+	return new_ptr;
 }
 
 void * malloc(size_t size)
@@ -125,6 +174,11 @@ void * malloc(size_t size)
 void free(void *ptr)
 {
 	dbg_free(ptr);
+}
+
+void * realloc(void * ptr, size_t size)
+{
+	return dbg_realloc(ptr, size, NULL, NULL, -1);
 }
 
 static void dbg_init() __attribute__((constructor));
@@ -142,6 +196,7 @@ dbg_init()
 	DL_FUNC(pthread_mutex_lock);
 	DL_FUNC(pthread_mutex_unlock);
 	DL_FUNC(clock_gettime);
+	DL_FUNC(memcpy);
 
 	dbg_ctx_init(&dbg_ctx);
 }
@@ -149,7 +204,8 @@ dbg_init()
 static void dbg_fini() __attribute__((destructor));
 void dbg_fini()
 {
-	dbg_dump();
+	//dbg_dump();
+	//libc_printf("\ndbg_fini\n");
 }
 
 
@@ -160,7 +216,24 @@ dbg_ctx_init(struct dbg_ctx * ctx)
 	ctx->head.prev = &ctx->head;
 	libc_pthread_mutex_init(&ctx->mutex, NULL);
 
-	//libc_printf("\ndbg_init done, memory dummy used %d\n", mem_free);
+	libc_printf("\ndbg_init done, memory dummy used %d\n", mem_free);
+}
+
+static int
+dbg_ptr_size(void *ptr)
+{
+	size_t size = 0;
+	size_t off = (uintptr_t)ptr - (uintptr_t)mem_dummy;
+	if (off > 0 && off <= mem_free) {
+		/* dummy memory */
+		size = mem_dummy[off-1];
+	} else if (libc_handle && ptr) {
+		struct dbg_mem * m = (struct dbg_mem *)(ptr - sizeof(*m));
+		if (m && m->magic == DBG_MAGIC && m->ptr == m) {
+			size = m->size;
+		}
+	}
+	return (int)size;
 }
 
 static int
