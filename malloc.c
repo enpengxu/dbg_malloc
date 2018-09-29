@@ -65,7 +65,7 @@ static void * (*libc_memcpy)(void *, const void *, size_t);
 #define DUMMY_SIZE   64*4096
 static unsigned mem_free = 0;
 static int mem_dummy[DUMMY_SIZE];
-
+/* this is not fork safe */
 static __thread int _tls_flag = 0;
 
 static struct dbg_ctx dbg_ctx = { 0 };
